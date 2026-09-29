@@ -4,23 +4,69 @@ format: html
 editor: visual
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
-```{r}
-1 + 1
-```
-
-You can add options to executable code like this
-
 ```{r}
 #| echo: false
-2 * 2
+#libraries
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(hms)
+library(ggplot2)
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r}
+#Gather data
+years=2021:2024
+wanted_variables=c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP", "PWGTP",
+            "FER", "HHL", "SCH", "SCHL", "SEX", "ST", "STATE",
+            "REGION", "DIVISION")
+
+
+dictionary_url = function(year) {
+  paste0("https://api.census.gov/data/", year, "/acs/acs1/pums/variables.json")
+}
+
+get_variables=function(year){
+  response=GET(dictionary_url(year))
+  stop_for_status(response)
+
+  parsed = fromJSON(rawToChar(response$content), simplifyVector = FALSE)
+  
+  all_vars=parsed$variables
+  
+  keep=intersect(wanted_variables,names(all_vars))
+  
+  lapply(all_vars[keep], function(var_info) {
+    items  = var_info$values$item
+    ranges = var_info$values$range
+    list(
+      label  = var_info$label,
+      values = if (is.null(items)) character(0) else unlist(items),
+      range  = if (is.null(ranges)) NULL else
+        do.call(rbind, lapply(ranges, as.data.frame))
+    )
+  })
+  }
+
+build_levels_rds = function(years = VALID_YEARS, path = LEVELS_RDS_PATH) {
+  levels_list = lapply(years, get_variable_levels)
+  names(levels_list) = as.character(years)
+  
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(levels_list, path)
+  invisible(levels_list)
+}
+
+
+
+load_year_levels = function(year, path = LEVELS_RDS_PATH) {
+  if (!file.exists(path)) {
+    stop("Could not find ", path, ". Run build_levels_rds() first.")
+  }
+  readRDS(path)[[as.character(year)]]
+}
+
+```
