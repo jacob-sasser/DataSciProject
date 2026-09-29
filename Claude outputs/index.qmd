@@ -1,0 +1,853 @@
+---
+title: "Commuting in North Carolina: Building Tools for the Census PUMS API"
+author: "Jacob Sasser"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-overflow: wrap
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+The U.S. Census Bureau's American Community Survey (ACS) asks millions of people each year about their age, schooling, housing and how they get to work. The **Public Use Microdata Sample (PUMS)** makes a sample of those responses available through an API. Each row is a (pseudo) person, and a weight, `PWGTP`, tells us how many people in the population that row stands for.
+
+Working with this API directly is a little painful: every value comes back as a character code (`SEX` is `"1"` or `"2"`, arrival time at work is a code like `"087"`), and every analysis needs to account for the person weights. The goal of this project is to write a small toolkit that hides that pain:
+
+1. **Data processing functions** that query the API for any of the years 2021–2024, check the user's inputs, and return a clean tibble with real numbers, times and labeled factors.
+2. **Generic functions** — our own `summary()` and `plot()` methods for a new `census` class — so that summarizing and plotting the data automatically uses the weights correctly.
+
+Once the tools are built, we put them to work on a real question: **how did commuting in North Carolina change from 2021 to 2024, as the country came out of the pandemic?**
+
+# Packages
+
+We use `httr` and `jsonlite` to talk to the API, the tidyverse packages (`dplyr`, `tibble`, `ggplot2`) to organize and plot data, `lubridate` to parse clock times, and `hms` to store times of day.
+
+```{r}
+#| label: packages
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(hms)
+library(ggplot2)
+```
+
+Next, a few constants that the functions below share. Keeping these in one place means that if an option changes (say a new survey year), there is only one spot to update.
+
+```{r}
+#| label: constants
+VALID_YEARS <- 2021:2024
+
+# Variables we keep from the dictionaries (state is ST in 2021/22, STATE in 2023/24)
+DICTIONARY_VARS <- c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP", "PWGTP",
+                     "FER", "HHL", "SCH", "SCHL", "SEX", "ST", "STATE",
+                     "REGION", "DIVISION")
+
+# Options the user may request
+NUMERIC_VARS     <- c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP")
+TIME_VARS        <- c("JWAP", "JWDP")
+CATEGORICAL_VARS <- c("FER", "HHL", "SCH", "SCHL", "SEX")
+GEOGRAPHY_LEVELS <- c("region", "division", "state")
+
+# We are not working with Puerto Rico, so its codes are removed from the options
+PUERTO_RICO_CODES <- list(state = "72", region = "9", division = "0")
+
+# Defaults when the user doesn't pick a specific place
+DEFAULT_GEO_VALUE <- list(state    = "37",  # North Carolina
+                          region   = "3",   # South
+                          division = "5")   # South Atlantic
+
+LEVELS_RDS_PATH <- "data/pums_variable_levels.rds"
+```
+
+The API works without a key, but a key raises the limit on how many calls we can make. To keep the key out of this public repo, it is saved in a text file, `API_KEY.txt`, that is listed in `.gitignore` so it never gets committed. If the file isn't there, the queries simply run without a key.
+
+```{r}
+#| label: api-key
+API_KEY_PATH <- "API_KEY.txt"
+
+#' Return "&key=..." to add to an API URL, or "" if there is no key file
+api_key_param <- function(path = API_KEY_PATH) {
+  if (!file.exists(path)) {
+    return("")
+  }
+  key <- trimws(readLines(path, n = 1, warn = FALSE))
+  if (length(key) == 0 || key == "") "" else paste0("&key=", key)
+}
+```
+
+# Part 1: Data Processing
+
+## Parsing the variable dictionaries
+
+Before we can turn codes into meaningful values, we need to know what each code means. The Census publishes a JSON data dictionary for every survey year. In that file, each variable has a `label` and a `values` element, which holds either an `item` list (code → description, e.g. `"1" = "Male"`) or a `range` (e.g. ages 0 to 99), or both.
+
+The function below `GET()`s a year's dictionary, parses the JSON, and uses base R list manipulation to keep only the variables we care about. For each variable we store its label, its code → description pairs as a named character vector, and any ranges.
+
+```{r}
+#| label: dictionary-functions
+#' Build the URL for a year's PUMS data dictionary
+dictionary_url <- function(year) {
+  paste0("https://api.census.gov/data/", year, "/acs/acs1/pums/variables.json")
+}
+
+#' GET a year's data dictionary and pull out the variables we care about
+get_variable_levels <- function(year) {
+  response <- GET(dictionary_url(year))
+  stop_for_status(response)
+
+  parsed <- fromJSON(rawToChar(response$content), simplifyVector = FALSE)
+  all_vars <- parsed$variables
+  keep <- intersect(DICTIONARY_VARS, names(all_vars))
+
+  lapply(all_vars[keep], function(var_info) {
+    items  <- var_info$values$item
+    ranges <- var_info$values$range
+    list(
+      label  = var_info$label,
+      values = if (is.null(items)) character(0) else unlist(items),
+      range  = if (is.null(ranges)) NULL else
+        do.call(rbind, lapply(ranges, as.data.frame))
+    )
+  })
+}
+
+#' Download every year's dictionary and save them together in one .rds file
+build_levels_rds <- function(years = VALID_YEARS, path = LEVELS_RDS_PATH) {
+  levels_list <- lapply(years, get_variable_levels)
+  names(levels_list) <- as.character(years)
+
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(levels_list, path)
+  invisible(levels_list)
+}
+
+#' Read the saved dictionaries and return one year's list
+load_year_levels <- function(year, path = LEVELS_RDS_PATH) {
+  if (!file.exists(path)) {
+    stop("Could not find ", path, ". Run build_levels_rds() first.")
+  }
+  readRDS(path)[[as.character(year)]]
+}
+```
+
+We only need to download the dictionaries once, so the `.rds` file is built only if it doesn't already exist in the `data` folder.
+
+```{r}
+#| label: build-rds
+if (!file.exists(LEVELS_RDS_PATH)) {
+  build_levels_rds()
+}
+variable_levels <- readRDS(LEVELS_RDS_PATH)
+names(variable_levels)
+names(variable_levels[["2021"]])
+names(variable_levels[["2024"]])
+```
+
+We now have one list per year. Notice that the state variable is called `ST` in 2021 and `STATE` in 2024; our functions will need to handle that. Here is what one categorical variable looks like:
+
+```{r}
+#| label: peek-levels
+variable_levels[["2024"]]$SEX
+```
+
+## Querying the API: the usual process
+
+Let's start with the usual process of calling the API with a hard-coded URL. The response's `content` is raw bytes; converting to characters and parsing the JSON gives a character matrix whose first row holds the column names.
+
+```{r}
+#| label: raw-query
+example_url <- paste0("https://api.census.gov/data/2024/acs/acs1/pums",
+                      "?get=SEX,PWGTP,MAR&for=state:37&SCHL=24",
+                      api_key_param())
+example_response <- GET(example_url)
+example_parsed <- fromJSON(rawToChar(example_response$content))
+head(example_parsed)
+```
+
+That works, but it isn't a tibble yet. The helper below takes whatever `GET()` returns and turns it into a tibble, using the first row as the column names.
+
+```{r}
+#| label: response-helper
+#' Helper: turn a GET() response from the PUMS API into a tibble
+api_response_to_tibble <- function(response) {
+  stop_for_status(response)
+  parsed <- fromJSON(rawToChar(response$content))
+  colnames(parsed) <- parsed[1, ]
+  as_tibble(parsed[-1, , drop = FALSE])
+}
+
+api_response_to_tibble(example_response)
+```
+
+Every column is still a character string, so the next job is converting those codes into useful values.
+
+## Helpers for converting codes
+
+### Matching API codes to dictionary codes
+
+The API and the dictionary don't always write codes the same way. For example, the dictionary lists arrival time codes as `"001"`, `"002"`, …, while the API may send `"1"`. The dictionary also uses blanks such as `"b"` or `"bb"` to mean "N/A", where the API may send `"0"`. These two small helpers put both sides into the same form before we look anything up.
+
+```{r}
+#| label: code-helpers
+#' Put codes in a common form: numeric codes lose leading zeros
+normalize_codes <- function(codes) {
+  codes <- trimws(as.character(codes))
+  is_number <- grepl("^[0-9]+$", codes)
+  codes[is_number] <- as.character(as.integer(codes[is_number]))
+  codes
+}
+
+#' Normalized lookup vector: names are codes, values are descriptions.
+#' A blank code ("b", "bb", ...) is also reachable through "0" when "0" is unused.
+dictionary_lookup <- function(values) {
+  lookup <- values
+  names(lookup) <- normalize_codes(names(values))
+
+  blank_codes <- grepl("^b+$", names(lookup))
+  if (any(blank_codes) && !("0" %in% names(lookup))) {
+    lookup <- c(lookup, setNames(lookup[blank_codes][1], "0"))
+  }
+  lookup
+}
+
+normalize_codes(c("001", "24", "bb", "0"))
+```
+
+### Time variables
+
+`JWAP` (time of arrival at work) and `JWDP` (time of departure for work) are coded as time windows, such as `"6:30 a.m. to 6:34 a.m."`. We want a single time for each person, so we take the **midpoint** of the window. The helpers below pull the two clock times out of the description with a regular expression, parse them with `lubridate::parse_date_time()`, and average them. Windows that cross midnight (e.g. `"11:55 p.m. to 12:04 a.m."`) need the end time pushed forward a day before averaging. Anything that isn't a time window, like `"N/A (not a worker)"`, becomes `NA`. The results are stored as `hms` times of day.
+
+```{r}
+#| label: time-helpers
+#' Convert clock strings like "6:30 a.m." to minutes after midnight
+clock_to_minutes <- function(clock_strings) {
+  clock_strings <- gsub("\\.", "", tolower(clock_strings))  # "6:30 am"
+  parsed <- parse_date_time(clock_strings, orders = "I:M p", quiet = TRUE)
+  hour(parsed) * 60 + minute(parsed)
+}
+
+#' Turn a time-window description into the midpoint of that window (hms)
+time_range_midpoint <- function(descriptions) {
+  clock <- "(\\d{1,2}:\\d{2}\\s*[ap]\\.?m\\.?)"
+  pattern <- paste0("^\\s*", clock, "\\s+to\\s+", clock)
+  matches <- regmatches(descriptions,
+                        regexec(pattern, descriptions, ignore.case = TRUE))
+
+  start_text <- vapply(matches, function(m) {
+    if (length(m) == 3) m[2] else NA_character_
+  }, character(1))
+  end_text <- vapply(matches, function(m) {
+    if (length(m) == 3) m[3] else NA_character_
+  }, character(1))
+
+  start_min <- clock_to_minutes(start_text)
+  end_min   <- clock_to_minutes(end_text)
+
+  # A window that crosses midnight ends "before" it starts
+  wraps <- !is.na(start_min) & !is.na(end_min) & end_min < start_min
+  end_min[wraps] <- end_min[wraps] + 24 * 60
+
+  mid_min <- ((start_min + end_min) / 2) %% (24 * 60)
+  hms(seconds = round(mid_min * 60))
+}
+
+time_range_midpoint(c("6:30 a.m. to 6:34 a.m.",
+                      "12:00 a.m. to 4:29 a.m.",
+                      "11:55 p.m. to 12:04 a.m.",
+                      "N/A (not a worker; worker who worked from home)"))
+```
+
+The midpoints look right, including the window that crosses midnight.
+
+### Numeric and categorical variables
+
+For the regular numeric variables, most codes are just numbers, but some are special values. For example, `GASP` (monthly gas cost) uses `1` to mean "included in rent", not \$1, and `JWMNP` (travel time to work) uses `0` for "N/A". The dictionary lists these special codes as `item`s, so we use it to turn any code described as N/A, "included in…" or "no charge" into `NA`. That keeps these codes from distorting our means.
+
+Categorical variables become factors whose labels come from the dictionary. The levels are ordered by code, which keeps ordinal variables like `SCHL` (educational attainment) in a sensible order.
+
+```{r}
+#| label: variable-parsers
+#' Convert an API time variable (JWAP/JWDP) from codes to hms midpoints
+parse_time_variable <- function(codes, var_levels) {
+  lookup <- dictionary_lookup(var_levels$values)
+  descriptions <- unname(lookup[normalize_codes(codes)])
+  time_range_midpoint(descriptions)
+}
+
+#' Convert an API numeric variable to numbers; special codes become NA
+parse_numeric_variable <- function(codes, var_levels) {
+  values <- suppressWarnings(as.numeric(codes))
+  if (is.null(var_levels) || length(var_levels$values) == 0) {
+    return(values)
+  }
+
+  lookup <- dictionary_lookup(var_levels$values)
+  is_special <- grepl("^N/A|included in|no charge", lookup, ignore.case = TRUE)
+  special_codes <- names(lookup)[is_special]
+
+  values[normalize_codes(codes) %in% special_codes] <- NA
+  values
+}
+
+#' Convert an API categorical variable into a factor labeled from the dictionary
+parse_categorical_variable <- function(codes, var_levels) {
+  lookup <- dictionary_lookup(var_levels$values)
+  lookup <- lookup[!duplicated(names(lookup))]
+
+  # Order the levels by their numeric code (non-numeric codes go last)
+  numeric_keys <- suppressWarnings(as.numeric(names(lookup)))
+  lookup <- lookup[order(is.na(numeric_keys), numeric_keys, names(lookup))]
+
+  factor(unname(lookup[normalize_codes(codes)]),
+         levels = unique(unname(lookup)))
+}
+
+parse_categorical_variable(c("2", "1", "1"), variable_levels[["2024"]]$SEX)
+```
+
+## Geography helpers
+
+The user can subset on a state, a division or a region. The allowed values come from our `.rds` file (from `ST` or `STATE`, depending on the year, and from `REGION` and `DIVISION`), with Puerto Rico removed. To make the function friendlier, the user can give a code (`"37"`), a full label, a plain name (`"North Carolina"`), a state abbreviation (`"NC"`), or `"all"`. The helper converts whatever they give into the codes the API expects, and gives an error listing the valid options if it can't find a match.
+
+```{r}
+#| label: geography-helpers
+#' Dictionary entry for a geography level, without Puerto Rico
+geography_levels <- function(year_levels, geography) {
+  dictionary_name <- switch(geography,
+    state    = intersect(c("STATE", "ST"), names(year_levels))[1],
+    region   = "REGION",
+    division = "DIVISION"
+  )
+  values <- year_levels[[dictionary_name]]$values
+  values <- values[normalize_codes(names(values)) !=
+                     PUERTO_RICO_CODES[[geography]]]
+  list(values = values)
+}
+
+#' Convert the user's subset value(s) into API codes ("*" for all)
+resolve_geography_codes <- function(geo_value, geography, year_levels) {
+  allowed <- geography_levels(year_levels, geography)$values
+  codes   <- normalize_codes(names(allowed))
+
+  if (length(geo_value) == 1 && tolower(geo_value) == "all") {
+    return("*")
+  }
+
+  labels        <- tolower(allowed)
+  short_names   <- tolower(trimws(sub("\\s*[/(].*$", "", allowed)))  # before / or (
+  abbreviations <- tolower(trimws(sub("^.*/", "", allowed)))        # after /
+
+  resolved <- vapply(geo_value, function(value) {
+    value_lower <- tolower(trimws(as.character(value)))
+    hit <- which(codes == normalize_codes(value_lower) |
+                   labels == value_lower |
+                   short_names == value_lower |
+                   (geography == "state" & abbreviations == value_lower))
+    if (length(hit) == 0) {
+      stop("'", value, "' is not a valid ", geography, " value. Options are:\n  ",
+           paste(allowed, collapse = "\n  "))
+    }
+    codes[hit[1]]
+  }, character(1))
+
+  # The API expects two-digit state codes
+  if (geography == "state") {
+    resolved <- sprintf("%02d", as.integer(resolved))
+  }
+  unname(resolved)
+}
+
+resolve_geography_codes(c("NC", "virginia", "13"), "state", variable_levels[["2024"]])
+resolve_geography_codes("South", "region", variable_levels[["2024"]])
+```
+
+## The single-year query function
+
+Now we can put everything together. `query_pums()` lets the user choose:
+
+- the **year** (a single value from 2021–2024, default 2024),
+- the **numeric variables** (default `AGEP`; `PWGTP` is always added, and at least one other numeric variable is required),
+- the **categorical variables** (default `SEX`; at least one is required),
+- the **geography level** (`"State"`, `"Division"` or `"Region"`, default `"State"`), and
+- the **specific place(s)** to subset on, or `"all"`.
+
+Input checks live in their own function so the main function stays readable. After the API call, each column is converted with the helpers above, the geography column the API adds is labeled, a `year` column is added, and finally the tibble gets the `census` class.
+
+```{r}
+#| label: query-functions
+#' Build the PUMS API URL for a single year
+build_pums_url <- function(year, variables, geography, geo_codes) {
+  paste0("https://api.census.gov/data/", year, "/acs/acs1/pums",
+         "?get=", paste(variables, collapse = ","),
+         "&for=", geography, ":", paste(geo_codes, collapse = ","),
+         api_key_param())
+}
+
+#' Check the user's inputs, stopping with an informative error if invalid
+check_query_inputs <- function(year, numeric_vars, categorical_vars, geography) {
+  if (length(year) != 1 || !(year %in% VALID_YEARS)) {
+    stop("year must be a single value from: ", paste(VALID_YEARS, collapse = ", "))
+  }
+
+  bad_numeric <- setdiff(numeric_vars, c(NUMERIC_VARS, "PWGTP"))
+  if (length(bad_numeric) > 0) {
+    stop("Invalid numeric variable(s): ", paste(bad_numeric, collapse = ", "),
+         ". Options are: ", paste(NUMERIC_VARS, collapse = ", "))
+  }
+  if (length(setdiff(numeric_vars, "PWGTP")) == 0) {
+    stop("At least one numeric variable other than PWGTP must be requested.")
+  }
+
+  bad_categorical <- setdiff(categorical_vars, CATEGORICAL_VARS)
+  if (length(bad_categorical) > 0) {
+    stop("Invalid categorical variable(s): ", paste(bad_categorical, collapse = ", "),
+         ". Options are: ", paste(CATEGORICAL_VARS, collapse = ", "))
+  }
+  if (length(categorical_vars) == 0) {
+    stop("At least one categorical variable must be requested.")
+  }
+
+  if (length(geography) != 1 || !(tolower(geography) %in% GEOGRAPHY_LEVELS)) {
+    stop("geography must be exactly one of: Region, Division, or State.")
+  }
+  invisible(TRUE)
+}
+
+#' Query the PUMS API for one year and return a processed census tibble
+query_pums <- function(year = 2024,
+                       numeric_vars = c("AGEP", "PWGTP"),
+                       categorical_vars = "SEX",
+                       geography = "State",
+                       geo_value = NULL,
+                       levels_path = LEVELS_RDS_PATH) {
+  numeric_vars <- toupper(numeric_vars)
+  categorical_vars <- toupper(categorical_vars)
+  check_query_inputs(year, numeric_vars, categorical_vars, geography)
+
+  geography    <- tolower(geography)
+  numeric_vars <- union("PWGTP", numeric_vars)
+  year_levels  <- load_year_levels(year, levels_path)
+
+  if (is.null(geo_value)) {
+    geo_value <- DEFAULT_GEO_VALUE[[geography]]
+  }
+  geo_codes <- resolve_geography_codes(geo_value, geography, year_levels)
+
+  url <- build_pums_url(year, c(numeric_vars, categorical_vars),
+                        geography, geo_codes)
+  census_data <- api_response_to_tibble(GET(url))
+
+  # Numeric and time variables
+  for (var in numeric_vars) {
+    if (var %in% TIME_VARS) {
+      census_data[[var]] <- parse_time_variable(census_data[[var]],
+                                                year_levels[[var]])
+    } else {
+      census_data[[var]] <- parse_numeric_variable(census_data[[var]],
+                                                   year_levels[[var]])
+    }
+  }
+
+  # Categorical variables
+  for (var in categorical_vars) {
+    census_data[[var]] <- parse_categorical_variable(census_data[[var]],
+                                                     year_levels[[var]])
+  }
+
+  # Label the geography column the API adds (e.g. "state")
+  census_data[[geography]] <- parse_categorical_variable(
+    census_data[[geography]], geography_levels(year_levels, geography)
+  )
+
+  census_data$year <- factor(year)
+
+  class(census_data) <- c("census", class(census_data))
+  census_data
+}
+```
+
+### Testing the single-year function
+
+First, the defaults: 2024, age and weight, sex, for North Carolina.
+
+```{r}
+#| label: test-default
+nc_default <- query_pums()
+class(nc_default)
+nc_default
+```
+
+Next, a different year, more variables, and a different geography: the New England division in 2022, with gross rent as a percentage of income (`GRPIP`), gas cost (`GASP`), arrival time at work (`JWAP`), household language (`HHL`) and school enrollment (`SCH`). Notice `JWAP` comes back as a time, and the rows where gas is included in rent have `NA` for `GASP` rather than 1.
+
+```{r}
+#| label: test-division
+new_england <- query_pums(year = 2022,
+                          numeric_vars = c("GRPIP", "GASP", "JWAP"),
+                          categorical_vars = c("HHL", "SCH"),
+                          geography = "Division",
+                          geo_value = "New England")
+new_england
+```
+
+Several states at once, using a mix of ways to name them:
+
+```{r}
+#| label: test-states
+carolinas <- query_pums(year = 2023,
+                        numeric_vars = "JWMNP",
+                        categorical_vars = "FER",
+                        geo_value = c("NC", "South Carolina"))
+count(as_tibble(carolinas), state)
+```
+
+The `"all"` option returns every value of the chosen geography. Pulling all states would download millions of rows, so here we just check that `"all"` becomes the `*` wildcard in the API call:
+
+```{r}
+#| label: test-all
+all_codes <- resolve_geography_codes("all", "region", variable_levels[["2024"]])
+all_url <- build_pums_url(2024, c("PWGTP", "AGEP", "SEX"), "region", all_codes)
+sub("&key=.*", "", all_url)  # don't print the API key on the website
+```
+
+Finally, the input checks. Each of these calls should fail with a helpful message.
+
+```{r}
+#| label: test-errors
+#| error: true
+query_pums(year = 2019)
+query_pums(numeric_vars = "PWGTP")
+query_pums(numeric_vars = c("AGEP", "INCOME"))
+query_pums(categorical_vars = character(0))
+query_pums(geography = "All")
+query_pums(geography = c("State", "Region"))
+query_pums(geo_value = "Puerto Rico")
+```
+
+## Combining years
+
+To study change over time, we need several years in one tibble. `query_pums_years()` accepts a vector of years plus any of the other `query_pums()` options (passed through `...`), calls the single-year function once per year, and stacks the results. Each piece already carries its `year` column. Because `bind_rows()` drops our custom class, we add `census` back at the end.
+
+```{r}
+#| label: multi-year-function
+#' Query several years and combine them into one census tibble
+query_pums_years <- function(years = 2024, ...) {
+  years <- unique(years)
+  bad_years <- setdiff(years, VALID_YEARS)
+  if (length(bad_years) > 0) {
+    stop("Invalid year(s): ", paste(bad_years, collapse = ", "),
+         ". Options are: ", paste(VALID_YEARS, collapse = ", "))
+  }
+
+  yearly_data <- lapply(years, function(one_year) {
+    as_tibble(query_pums(year = one_year, ...))
+  })
+
+  combined <- bind_rows(yearly_data)
+  combined$year <- factor(combined$year, levels = as.character(sort(years)))
+
+  class(combined) <- c("census", class(combined))
+  combined
+}
+```
+
+A quick test with two years and a bad year:
+
+```{r}
+#| label: test-multi-year
+#| error: true
+nc_two_years <- query_pums_years(c(2021, 2024), numeric_vars = c("AGEP", "GRPIP"),
+                                 categorical_vars = c("SEX", "HHL"))
+count(as_tibble(nc_two_years), year)
+
+query_pums_years(c(2020, 2024))
+```
+
+# Part 2: Generic Functions for Summarizing
+
+Each row in our data does **not** stand for a single person: `PWGTP` says how many people it represents. We could copy each row `PWGTP` times, but that would create huge tibbles. Instead, every summary needs to use the weights.
+
+This is a good place for object-oriented programming. Generic functions such as `summary()` and `plot()` call `UseMethod()`, which looks at the class of the object and dispatches to the matching method. Because our tibbles have the class `census`, we can write `summary.census()` and `plot.census()`, and R will use them automatically whenever we call `summary()` or `plot()` on our data.
+
+```{r}
+#| label: generic-demo
+plot
+```
+
+## Numeric and categorical summaries
+
+`summary.census()` returns a named list:
+
+- `$numeric`: the weighted mean and standard deviation of each numeric variable,
+  $$\bar{x}_w = \frac{\sum w_i x_i}{\sum w_i}, \qquad s_w = \sqrt{\frac{\sum w_i x_i^2}{\sum w_i} - \bar{x}_w^2}$$
+- `$categorical`: counts for each level of each categorical variable. The counts are weighted by `PWGTP`, so they estimate the number of *people* in each group, not the number of rows.
+
+By default it summarizes every numeric variable except `PWGTP` (time variables are skipped) and every categorical variable, including `year` and the geography column. The user can instead pick the variables. Missing values (such as `JWMNP` for non-workers) are dropped from each calculation.
+
+```{r}
+#| label: summary-method
+#' Weighted mean using PWGTP as the weight
+weighted_mean <- function(values, weights) {
+  keep <- !is.na(values) & !is.na(weights)
+  sum(values[keep] * weights[keep]) / sum(weights[keep])
+}
+
+#' Weighted standard deviation using PWGTP as the weight
+weighted_sd <- function(values, weights) {
+  keep <- !is.na(values) & !is.na(weights)
+  sample_mean <- weighted_mean(values, weights)
+  sqrt(sum(values[keep]^2 * weights[keep]) / sum(weights[keep]) - sample_mean^2)
+}
+
+#' Names of plain numeric columns (no PWGTP, no time columns)
+census_numeric_columns <- function(census_data) {
+  is_plain_numeric <- vapply(census_data, function(column) {
+    is.numeric(column) && !inherits(column, c("hms", "difftime"))
+  }, logical(1))
+  setdiff(names(census_data)[is_plain_numeric], "PWGTP")
+}
+
+#' Names of categorical (factor) columns, including year
+census_categorical_columns <- function(census_data) {
+  names(census_data)[vapply(census_data, is.factor, logical(1))]
+}
+
+#' Summary method for census tibbles
+summary.census <- function(object,
+                           numeric_vars = NULL,
+                           categorical_vars = NULL,
+                           ...) {
+  if (is.null(numeric_vars)) {
+    numeric_vars <- census_numeric_columns(object)
+  }
+  if (is.null(categorical_vars)) {
+    categorical_vars <- census_categorical_columns(object)
+  }
+
+  bad_numeric <- setdiff(numeric_vars, census_numeric_columns(object))
+  if (length(bad_numeric) > 0) {
+    stop("Not numeric (non-time, non-PWGTP) columns in this data: ",
+         paste(bad_numeric, collapse = ", "))
+  }
+  bad_categorical <- setdiff(categorical_vars, census_categorical_columns(object))
+  if (length(bad_categorical) > 0) {
+    stop("Not categorical columns in this data: ",
+         paste(bad_categorical, collapse = ", "))
+  }
+
+  weights <- object$PWGTP
+
+  numeric_summaries <- lapply(numeric_vars, function(var) {
+    c(mean = weighted_mean(object[[var]], weights),
+      sd   = weighted_sd(object[[var]], weights))
+  })
+  names(numeric_summaries) <- numeric_vars
+
+  categorical_summaries <- lapply(categorical_vars, function(var) {
+    tibble(level = object[[var]], PWGTP = weights) |>
+      count(level, wt = PWGTP, name = "count")
+  })
+  names(categorical_summaries) <- categorical_vars
+
+  list(numeric = numeric_summaries, categorical = categorical_summaries)
+}
+```
+
+Using the defaults on our first query gives the weighted mean and SD of age in North Carolina, plus the estimated number of people of each sex:
+
+```{r}
+#| label: test-summary-default
+summary(nc_default)
+```
+
+Choosing specific variables on the two-year data:
+
+```{r}
+#| label: test-summary-choose
+summary(nc_two_years, numeric_vars = "GRPIP", categorical_vars = c("year", "HHL"))
+```
+
+And on the New England data, where `JWAP` is a time variable and is skipped automatically:
+
+```{r}
+#| label: test-summary-division
+summary(new_england, categorical_vars = "SCH")
+```
+
+## Graphical summaries
+
+`plot.census()` requires one categorical variable (which may be `year`) and one numeric variable, both passed as strings. It draws boxplots of the numeric variable at each level of the categorical variable. Including `weight = PWGTP` in `aes()` makes rows that stand for more people count more toward the boxplot.
+
+```{r}
+#| label: plot-method
+#' Plot method for census tibbles: weighted boxplots of num_var by cat_var
+plot.census <- function(x, cat_var, num_var, ...) {
+  if (missing(cat_var) || missing(num_var)) {
+    stop("Please give both cat_var and num_var (as strings).")
+  }
+  if (length(cat_var) != 1 || !(cat_var %in% census_categorical_columns(x))) {
+    stop("cat_var must be one categorical column: ",
+         paste(census_categorical_columns(x), collapse = ", "))
+  }
+  if (length(num_var) != 1 || !(num_var %in% census_numeric_columns(x))) {
+    stop("num_var must be one numeric column: ",
+         paste(census_numeric_columns(x), collapse = ", "))
+  }
+
+  ggplot(as_tibble(x),
+         aes(x = get(cat_var), y = get(num_var), weight = PWGTP)) +
+    geom_boxplot(na.rm = TRUE) +
+    labs(x = cat_var, y = num_var,
+         title = paste("Weighted distribution of", num_var, "by", cat_var)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+```
+
+A few tests, including two that should fail (a time variable, and a missing argument):
+
+```{r}
+#| label: test-plot
+#| error: true
+plot(nc_default, "SEX", "AGEP")
+plot(nc_two_years, "HHL", "GRPIP")
+plot(new_england, "SCH", "JWAP")
+plot(nc_default, "SEX")
+```
+
+# Investigation: How Did Commuting in North Carolina Change, 2021–2024?
+
+The pandemic sent many people home to work, and since then many employers have called workers back to the office. Did North Carolina's commutes change over that period? We'll use our tools to look at three things for 2021–2024:
+
+1. How many people commute at all,
+2. How long their commutes are, and
+3. When they leave for work.
+
+We pull four years of North Carolina data with age, travel time to work (`JWMNP`), arrival and departure times (`JWAP`, `JWDP`), sex and educational attainment.
+
+```{r}
+#| label: nc-commute-data
+nc_commute <- query_pums_years(2021:2024,
+                               numeric_vars = c("AGEP", "JWMNP", "JWAP", "JWDP"),
+                               categorical_vars = c("SEX", "SCHL"),
+                               geo_value = "North Carolina")
+count(as_tibble(nc_commute), year)
+```
+
+## Who commutes?
+
+`JWMNP` is `NA` for people who don't work *and* for people who work from home, so the share of adults with a recorded commute gives a rough measure of how many are traveling to a workplace.
+
+```{r}
+#| label: commute-share
+commute_share <- nc_commute |>
+  as_tibble() |>
+  filter(AGEP >= 16) |>
+  group_by(year) |>
+  summarize(pct_commuting = 100 * sum(PWGTP[!is.na(JWMNP)]) / sum(PWGTP))
+commute_share
+
+share_first <- round(commute_share$pct_commuting[1], 1)
+share_last  <- round(commute_share$pct_commuting[nrow(commute_share)], 1)
+```
+
+Among North Carolinians aged 16 and older, an estimated `r share_first`% had a commute in 2021, compared with `r share_last`% in 2024 — a `r ifelse(share_last > share_first, "rise", "drop")` of `r abs(round(share_last - share_first, 1))` percentage points. Because this share mixes changes in employment with changes in working from home, it's a hint of a trend rather than proof. `r ifelse(share_last > share_first, 'A rise fits the story of workers returning to the office.', 'A drop suggests working from home (or not working) held on or grew.')`
+
+<!-- CHECK after rendering with real data: add a sentence of your own interpreting this. -->
+
+## How long are commutes?
+
+For the rest of the investigation we keep only people with a commute. We use `filter()`, which keeps our `census` class, so our generic functions still work on the result.
+
+```{r}
+#| label: commuters
+commuters <- filter(nc_commute, !is.na(JWMNP))
+class(commuters)
+
+commute_summary <- summary(commuters, numeric_vars = "JWMNP",
+                           categorical_vars = "year")
+commute_summary
+```
+
+```{r}
+#| label: plot-commute-year
+plot(commuters, "year", "JWMNP")
+```
+
+```{r}
+#| label: commute-year-numbers
+#| include: false
+commute_by_year <- commuters |>
+  as_tibble() |>
+  group_by(year) |>
+  summarize(mean_minutes = weighted_mean(JWMNP, PWGTP))
+minutes_first <- round(commute_by_year$mean_minutes[1], 1)
+minutes_last  <- round(commute_by_year$mean_minutes[nrow(commute_by_year)], 1)
+```
+
+Across all four years, the average North Carolina commute was about `r round(commute_summary$numeric$JWMNP["mean"], 1)` minutes, with a standard deviation of about `r round(commute_summary$numeric$JWMNP["sd"], 1)` minutes. By year, the average went from `r minutes_first` minutes in 2021 to `r minutes_last` minutes in 2024. The boxplots let us compare the middle 50% of commutes across years and show the long right tail of people who travel much longer than average.
+
+<!-- CHECK after rendering: describe what the boxplots actually show (is the median stable? how long is the tail?). Do the same for the SEX and SCHL plots below. -->
+
+Does commute length differ by sex? Here we plot 2024 only.
+
+```{r}
+#| label: plot-commute-sex
+commuters_2024 <- filter(commuters, year == "2024")
+plot(commuters_2024, "SEX", "JWMNP")
+summary(commuters_2024, numeric_vars = c("JWMNP", "AGEP"), categorical_vars = "SEX")
+```
+
+And by educational attainment. `SCHL` has many levels, so the plot is wide:
+
+```{r}
+#| label: plot-commute-schl
+#| fig-width: 11
+#| fig-height: 6
+plot(commuters_2024, "SCHL", "JWMNP")
+```
+
+## When do people leave for work?
+
+Our plot method skips time variables, but we can add a numeric version of the departure time: the hour of the day as a decimal (so 7:30 a.m. is 7.5). Because the result still has the `census` class, `summary()` and `plot()` pick up the new column right away.
+
+```{r}
+#| label: departure-hour
+commuters$depart_hour <- as.numeric(commuters$JWDP) / 3600
+
+departure_summary <- summary(commuters, numeric_vars = "depart_hour",
+                             categorical_vars = "year")
+departure_summary$numeric
+plot(commuters, "year", "depart_hour")
+```
+
+```{r}
+#| label: departure-numbers
+#| include: false
+format_clock <- function(decimal_hour) {
+  format(as.POSIXct(decimal_hour * 3600, origin = "1970-01-01", tz = "UTC"),
+         "%I:%M %p")
+}
+departure_mean <- format_clock(departure_summary$numeric$depart_hour["mean"])
+```
+
+The average departure time across all years is about `r departure_mean`. The boxplots show where the middle half of departures falls each year, which lets us check whether the morning rush shifted as people returned to offices.
+
+<!-- CHECK after rendering: describe whether the departure window moved. -->
+
+# Conclusion
+
+We built a set of tools that turn the raw, coded PUMS API into analysis-ready data:
+
+- `get_variable_levels()` and `build_levels_rds()` download and save each year's data dictionary.
+- `query_pums()` checks its inputs, queries a single year, and converts codes into numbers, times and labeled factors, returning a `census` tibble. `query_pums_years()` does the same for several years at once.
+- `summary.census()` and `plot.census()` give weighted summaries and boxplots through R's generic functions, so users never have to remember to apply `PWGTP` themselves.
+
+Using these tools on North Carolina, we saw the share of adults with a commute go from `r share_first`% in 2021 to `r share_last`% in 2024, while the average commute went from `r minutes_first` to `r minutes_last` minutes. A natural next step would be to compare North Carolina with other states or regions, which our functions already support through the `geography` and `geo_value` arguments.

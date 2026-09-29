@@ -15,11 +15,23 @@ library(tibble)
 library(lubridate)
 library(hms)
 library(ggplot2)
+
+API_KEY_PATH <- "API_KEY.txt"
+
+api_key_param <- function(path = API_KEY_PATH) {
+  if (!file.exists(path)) {
+    return("")
+  }
+  key <- trimws(readLines(path, n = 1, warn = FALSE))
+  if (length(key) == 0 || key == "") "" else paste0("&key=", key)
+}
+
+LEVELS_RDS_PATH <- "data/pums_variable_levels.rds"
 ```
 
 ```{r}
 #Gather data
-years=2021:2024
+valid_years=2021:2024
 wanted_variables=c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP", "PWGTP",
             "FER", "HHL", "SCH", "SCHL", "SEX", "ST", "STATE",
             "REGION", "DIVISION")
@@ -51,8 +63,8 @@ get_variables=function(year){
   })
   }
 
-build_levels_rds = function(years = VALID_YEARS, path = LEVELS_RDS_PATH) {
-  levels_list = lapply(years, get_variable_levels)
+build_levels_rds = function(years = valid_years, path = LEVELS_RDS_PATH) {
+  levels_list = lapply(years, get_variables)
   names(levels_list) = as.character(years)
   
   dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
@@ -69,4 +81,11 @@ load_year_levels = function(year, path = LEVELS_RDS_PATH) {
   readRDS(path)[[as.character(year)]]
 }
 
+
+```
+
+```{r}
+if (!file.exists(LEVELS_RDS_PATH)) {
+  build_levels_rds()
+}
 ```
